@@ -1,0 +1,100 @@
+#!/usr/bin/envbash
+# bin/compile <build-dir> <cache-dir>
+#
+# Some parts of this are "borrowed" from 
+# heroku-buildpack-python
+
+set -eo pipefail
+
+export PATH=:/usr/local/bin:$PATH
+
+BUILD_DIR=$1
+CACHE_DIR=$2
+
+NGINX_URL=http://dl.dropbox.com/u/2325654/nginx.tar.gz
+NGINX_PATH="nginx"
+NGINX_VERSION=1.0.12
+
+if [ ! -d $NGINX_PATH ]; then
+    echo "-----> Bundling nginx v$NGINX_VERSION"
+    curl --silent --max-time 60 --location $NGINX_URL | tar xz
+fi
+
+cat >>boot.sh <<EOF
+sed -i 's/listen       80;/listen '\$PORT';/' /app/nginx/conf/nginx.conf
+sed -i 's/root   html;/root   /app/output;' /app/nginx/conf/nginx.conf
+echo "Launching nginx"
+exec /app/nginx/bin/nginx
+EOF
+
+chmod +x boot.sh
+
+PIP_DOWNLOAD_CACHE=${PIP_DOWNLOAD_CACHE:-$CACHE_DIR/pip_downloads}
+VIRTUALENV_DIRS="bin include lib"
+export PIP_DOWNLOAD_CACHE
+
+function virtualenv() {
+  python "$ROOT_DIR/src/virtualenv-1.7/virtualenv.py" "$@"
+}
+
+indent() {
+  RE="s/^/       /"
+  [ $(uname) == "Darwin" ] && sed -l "$RE" || sed -u "$RE"
+}
+
+# Copy artifacts out of cache if exists.
+mkdir -p $CACHE_DIR
+for dir in $VIRTUALENV_DIRS; do
+  cp -R $CACHE_DIR/$dir . &> /dev/null || true
+done
+
+# Create virtualenv. Rebuild if corrupt.
+set +e
+echo "-----> Preparing virtualenv version $(virtualenv --version)"
+
+# Try to create the virtualenv.
+OUT=$(virtualenv --distribute --never-download  --prompt=venv . 2>&1)
+
+# If there's an error, purge and recreate.
+[ $? -ne 0 ] && {
+  echo " !     Virtualenv corrupt, rebuilding."
+  for dir in $VIRTUALENV_DIRS; do
+    rm -fr $dir &> /dev/null || true
+  done
+  OUT=$(virtualenv --distribute --never-download  --prompt=venv . )
+}
+echo "$OUT" | indent
+
+set -e
+
+# Create set-aside .heroku folder.
+mkdir -p .heroku
+
+# Activate the virtualenv.
+echo "-----> Activating virtualenv"
+source bin/activate
+
+echo "-----> Installing pelican"
+pip install --use-mirrors pelican --src ./.heroku/src | indent
+
+echo "-----> Installing Markdown"
+pip install --use-mirrors Markdown --src ./.heroku/src | indent
+
+# Make virtualenv relocatable.
+set +e
+OUT=$(virtualenv --relocatable .)
+[ $? -ne 0 ] && {
+  echo " !     Error making virtualenv relocatable"
+  echo "$OUT" | indent
+  exit 1
+}
+set -e
+
+# Store new artifacts in cache.
+for dir in $VIRTUALENV_DIRS; do
+  rm -rf $CACHE_DIR/$dir
+  cp -R $dir $CACHE_DIR/
+done
+
+echo "-----> Build pelican"
+pelican -d -s settings.py content
